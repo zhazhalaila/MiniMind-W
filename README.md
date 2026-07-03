@@ -1,7 +1,6 @@
 # MiniMind-W
 
-
-## Day1-预训练数据链路
+## 预训练数据链路
 
 ```text
 jsonl 文本
@@ -40,3 +39,47 @@ jsonl 文本
 ```text
 (B, max_length)
 ```
+
+## 预训练模型（Dense Model，不包含完整的训练过程，只是搭建Decoder-Only的网络架构）
+
+![MiniMind Dense Model](figs/MiniMind_Dense_Model.jpg)
+
+把 `input_ids` 送进一个最小的 Decoder-Only 模型前向里，并且能拿到 `logits` 和 `loss`。
+
+主线是：
+
+```text
+input_ids
+-> token embedding
+-> decoder layers
+-> final norm
+-> lm head
+-> logits
+-> shifted cross entropy loss
+```
+
+```text
+input_ids
+-> token embedding
+-> decoder layers
+-> final norm
+-> lm head
+-> logits
+-> shifted cross entropy loss
+```
+
+### 输入
+
+- `input_ids: torch.Tensor`
+  - shape: `(B, L)`
+- `labels: torch.Tensor | None`
+  - shape: `(B, L)`
+
+### 输出
+
+- `last_hidden_state`
+  - shape: `(B, L, D)`
+- `logits`
+  - shape: `(B, L, V)`
+- `loss`
+  - shape: `()`
