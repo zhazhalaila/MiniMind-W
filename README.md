@@ -83,3 +83,60 @@ input_ids
   - shape: `(B, L, V)`
 - `loss`
   - shape: `()`
+
+## 预训练最小训练闭环
+
+把前两天已经完成的 `dataset` 和 `MiniMindForCausalLM` 接起来，真正跑通最小训练闭环。
+
+主线是：
+
+```text
+jsonl records
+-> PretrainDataset
+-> DataLoader
+-> batch["input_ids"], batch["labels"]
+-> MiniMindForCausalLM
+-> logits, loss
+-> backward
+-> optimizer.step()
+-> save checkpoint
+```
+
+## 输入与输出
+
+### 输入
+
+- `dataset`
+  - 单条样本输出：
+    - `input_ids.shape == (L,)`
+    - `labels.shape == (L,)`
+- `model`
+  - `MiniMindForCausalLM`
+- `optimizer`
+  - `AdamW` 
+
+### 输出
+
+- 一个训练 batch
+  - `batch["input_ids"].shape == (B, L)`
+  - `batch["labels"].shape == (B, L)`
+- 一个 step 的 `loss`
+  - shape: `()`
+- 一个训练循环的 `loss_history`
+  - `len(loss_history) == max_steps`
+- 一个 checkpoint 文件
+
+## 例子
+
+如果：
+
+- `batch_size = 2`
+- `max_length = 8`
+- `vocab_size = 32`
+
+那么：
+
+- `batch["input_ids"].shape == (2, 8)`
+- `batch["labels"].shape == (2, 8)`
+- `logits.shape == (2, 8, 32)`
+- `loss.shape == ()`
