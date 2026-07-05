@@ -140,3 +140,44 @@ jsonl records
 - `batch["labels"].shape == (2, 8)`
 - `logits.shape == (2, 8, 32)`
 - `loss.shape == ()`
+
+## 预训练入口与 Smoke Test
+
+把前面已经完成的模块接成一个真正可执行的预训练入口，并且准备一个最小 smoke test。
+
+主线是：
+
+```text
+project_root
+-> build configs
+-> load tokenizer
+-> build dataset
+-> build dataloader
+-> build model
+-> build optimizer
+-> run_pretrain_train_loop
+-> save checkpoint
+-> load checkpoint
+```
+
+## 输入与输出
+
+### 输入
+
+- `project_root: str`
+- `PretrainDataConfig`
+- `PretrainTrainConfig`
+- `MiniMindConfig`
+
+### 输出
+
+- `runtime` 字典
+  - `runtime["tokenizer"]`
+  - `runtime["dataset"]`
+  - `runtime["dataloader"]`
+  - `runtime["model"]`
+  - `runtime["optimizer"]`
+- `loss_history`
+  - `len(loss_history) == max_steps`
+- checkpoint 文件
+- 读回来的 checkpoint 字典
