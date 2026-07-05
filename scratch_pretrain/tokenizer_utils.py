@@ -19,7 +19,7 @@ def load_tokenizer(tokenizer_dir: str) -> Any:
         tokenizer: Any
     """
     if AutoTokenizer is None:
-        raise ModuleNotFoundError("transformer is not installed")
+        raise ModuleNotFoundError("transformers is not installed")
     
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
     return tokenizer

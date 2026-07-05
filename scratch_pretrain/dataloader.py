@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -50,6 +50,8 @@ def build_pretrain_dataloader(
     dataset: Dataset,
     batch_size: int,
     shuffle: bool = True,
+    num_workers: int = 0,
+    generator: Optional[torch.Generator] = None,
 ) -> DataLoader:
     """
     Build the minimal pretrain dataloader.
@@ -61,6 +63,8 @@ def build_pretrain_dataloader(
             - labels: shape (L,)
         batch_size: int
         shuffle: bool
+        num_workers: int
+        generator: torch.Generator | None
 
     Output:
         dataloader: torch.utils.data.DataLoader
@@ -73,6 +77,8 @@ def build_pretrain_dataloader(
             dataset,
             batch_size=batch_size,
             shuffle=shuffle,
+            num_workers=num_workers,
+            generator=generator,
             collate_fn=collate_pretrain_batch,
         )
     """
@@ -81,5 +87,7 @@ def build_pretrain_dataloader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
+        num_workers=num_workers,
+        generator=generator,
         collate_fn=collate_pretrain_batch,
     )
