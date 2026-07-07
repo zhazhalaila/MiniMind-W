@@ -254,7 +254,7 @@ python3 scratch_pretrain/train_pretrain.py \
 
 把 Dense 版预训练主线扩展成 MoE 版预训练主线。
 
-![MiniMind MoE Model](figs/MiniMind_Moe_Model.jpg)
+![MiniMind MoE Model](figs/MiniMind_MoE_Model.jpg)
 
 ### 主线
 
