@@ -181,3 +181,132 @@ project_root
   - `len(loss_history) == max_steps`
 - checkpoint 文件
 - 读回来的 checkpoint 字典
+
+## `train_pretrain.py`
+
+把下面这些能力接起来：
+
+- 读取命令行参数
+- 构造 tokenizer / dataset / dataloader / model / optimizer
+- 运行正式 train loop
+- 支持 gradient accumulation
+- 支持 grad clipping
+- 支持 warmup + cosine learning rate decay
+- 支持 `float16` 下的 `GradScaler`
+- 支持 checkpoint resume
+- 把日志写到 `logs/`
+- 把续训断点写到 `checkpoints/`
+- 把最终权重导出到 `out/`
+
+### 主线
+
+```text
+parse args
+-> build runtime
+-> optional load weight
+-> optional resume checkpoint
+-> build autocast / grad scaler
+-> training loop
+   -> forward
+   -> backward
+   -> accumulation
+   -> grad clipping
+   -> optimizer step
+   -> lr scheduling
+   -> logging
+   -> checkpoint save
+-> final checkpoint save
+-> final weight export
+```
+
+### 训练命令
+
+```bash
+python3 scratch_pretrain/train_pretrain.py \
+  --tokenizer_dir tokenizer \
+  --data_path data/pretrain_t2t_mini.jsonl \
+  --log_dir logs/pretrain_dense \
+  --checkpoint_dir checkpoints/pretrain_dense \
+  --out_dir out/pretrain_dense \
+  --save_weight pretrain_dense \
+  --epochs 1 \
+  --batch_size 8 \
+  --learning_rate 5e-4 \
+  --weight_decay 0.1 \
+  --device cuda:0 \
+  --dtype bfloat16 \
+  --num_workers 8 \
+  --accumulation_steps 8 \
+  --grad_clip 1.0 \
+  --log_interval 100 \
+  --save_interval 1000 \
+  --warmup_steps 1000 \
+  --min_lr_ratio 0.1 \
+  --hidden_size 768 \
+  --num_hidden_layers 8 \
+  --num_attention_heads 8 \
+  --num_key_value_heads 2 \
+  --intermediate_size 2048 \
+  --max_seq_len 512
+```
+
+## 预训练阶段的 MoE 接入
+
+把 Dense 版预训练主线扩展成 MoE 版预训练主线。
+
+![MiniMind Dense Model](figs/MiniMind_Dense_Model.jpg)
+
+### 主线
+
+```text
+parse moe args
+-> build moe kwargs
+-> merge into model config
+-> build moe model
+-> forward returns lm_loss
+-> collect router_aux_loss
+-> combine to total_loss
+-> backward
+-> save dense / moe weight names
+```
+
+### 训练命令
+
+```bash
+python3 scratch_pretrain/train_pretrain.py \
+  --tokenizer_dir tokenizer \
+  --data_path data/pretrain_t2t_mini.jsonl \
+  --log_dir logs/pretrain_moe \
+  --checkpoint_dir checkpoints/pretrain_moe \
+  --out_dir out/pretrain_moe \
+  --save_weight pretrain \
+  --from_weight none \
+  --from_resume none \
+  --epochs 2 \
+  --batch_size 32 \
+  --learning_rate 5e-4 \
+  --weight_decay 0.0 \
+  --device cuda:0 \
+  --dtype bfloat16 \
+  --num_workers 8 \
+  --accumulation_steps 8 \
+  --grad_clip 1.0 \
+  --log_interval 100 \
+  --save_interval 1000 \
+  --warmup_steps 0 \
+  --min_lr_ratio 1.0 \
+  --hidden_size 768 \
+  --num_hidden_layers 8 \
+  --num_attention_heads 8 \
+  --num_key_value_heads 4 \
+  --intermediate_size 2432 \
+  --max_seq_len 340 \
+  --max_position_embeddings 32768 \
+  --rope_theta 1000000 \
+  --rms_norm_eps 1e-6 \
+  --use_moe 1 \
+  --num_experts 4 \
+  --num_experts_per_tok 1 \
+  --moe_intermediate_size 2432 \
+  --router_aux_loss_coef 5e-4
+```

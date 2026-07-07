@@ -347,7 +347,7 @@ python3 scratch_pretrain/train_pretrain.py \
   --accumulation_steps 1 \
   --grad_clip 1.0 \
   --log_interval 1 \
-  --save_interval 5000 \
+  --save_interval 100 \
   --warmup_steps 0 \
   --min_lr_ratio 0.1 \
   --hidden_size 16 \

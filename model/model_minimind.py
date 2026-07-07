@@ -65,6 +65,11 @@ class MiniMindConfig:
     max_position_embeddings: int = 512
     rope_theta: float = 10000.0
     rms_norm_eps: float = 1e-6
+    use_moe: bool = False
+    num_experts: int = 4
+    num_experts_per_tok: int = 1
+    moe_intermediate_size: Optional[int] = None
+    router_aux_loss_coef: float = 5e-4
     head_dim: int = field(init=False)
 
     def __post_init__(self) -> None:
@@ -88,8 +93,19 @@ class MiniMindConfig:
             raise ValueError("num_attention_heads must be divisible by num_key_value_heads.")
         if self.rms_norm_eps <= 0:
             raise ValueError("rms_norm_eps must be positive.")
+        if self.use_moe:
+            if self.num_experts <= 0:
+                raise ValueError("num_experts must be positive when use_moe=True.")
+            if self.num_experts_per_tok <= 0:
+                raise ValueError("num_experts_per_tok must be positive when use_moe=True.")
+            if self.num_experts_per_tok > self.num_experts:
+                raise ValueError("num_experts_per_tok must not exceed num_experts.")
+            if self.router_aux_loss_coef < 0:
+                raise ValueError("router_aux_loss_coef must be non-negative.")
 
         object.__setattr__(self, "head_dim", self.hidden_size // self.num_attention_heads)
+        if self.moe_intermediate_size is None:
+            object.__setattr__(self, "moe_intermediate_size", self.intermediate_size)
 
 
 @dataclass
@@ -391,27 +407,37 @@ class MLP(nn.Module):
             Shape: (B, L, D)
     """
 
-    def __init__(self, config: MiniMindConfig):
+    def __init__(
+            self, 
+            config: MiniMindConfig,
+            intermediate_size: Optional[int] = None,
+            ):
         super().__init__()
         self.config = config
+
+        self.intermediate_size = (
+            intermediate_size
+            if intermediate_size is not None
+            else config.intermediate_size
+        )
 
         # gate unit
         self.gate_proj = nn.Linear(
             config.hidden_size,
-            config.intermediate_size,
+            self.intermediate_size,
             bias=False
         )
 
         # up dimension
         self.up_proj = nn.Linear(
             config.hidden_size,
-            config.intermediate_size,
+            self.intermediate_size,
             bias=False
         )
 
         # down dimension
         self.down_proj = nn.Linear(
-            config.intermediate_size,
+            self.intermediate_size,
             config.hidden_size,
             bias=False
         )
@@ -428,6 +454,104 @@ class MLP(nn.Module):
         return out
 
 
+class MoEFeedForward(nn.Module):
+    """
+    MoE feed-forward skeleton.
+
+    Input to forward:
+        x: torch.Tensor
+            Shape: (B, L, D)
+
+    Output from forward:
+        torch.Tensor
+            Shape: (B, L, D)
+    """
+
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+        
+        # router gate, shape (B, L, num_experts)
+        self.gate = nn.Linear(
+            config.hidden_size,
+            config.num_experts,
+            bias=False,
+        )
+
+        # create experts, each expert is a feed-forward network
+        self.experts = nn.ModuleList(
+            [
+                MLP(config, intermediate_size=config.moe_intermediate_size) 
+                for _ in range(config.num_experts)
+            ]
+        )
+
+        self.aux_loss: Optional[torch.Tensor] = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, hidden_dim = x.shape
+
+        # flatten x (B, L, D) -> (B*L, D)
+        x_flat = x.view(batch_size * seq_len, hidden_dim)
+
+        # shape (B*L, num_experts)
+        scores = self.gate(x_flat)
+        scores = F.softmax(scores, dim=-1)
+
+        # topk_weight shape (B*L, K) where K = selected top-k experts per token
+        # topk_idx shape (B*L, K) where K = selected top-k experts per token
+
+        topk_weight, topk_idx = torch.topk(
+            scores,
+            k=self.config.num_experts_per_tok,
+            dim=-1,
+            sorted=False,
+        )
+
+        # normalize topk_weight
+        topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
+
+        # output tenser: (B*L, D)
+        y = torch.zeros_like(x_flat)
+
+        for i, expert in enumerate(self.experts):
+            # mask shape (B*L, K)
+            mask = (topk_idx == i)
+
+            if mask.any():
+                # shape (B*L, N)
+                # for each expert, we select the tokens that are routed to it
+                # notice, tokens from (B*L)
+                token_idx = mask.any(dim=-1).nonzero(as_tuple=False).flatten()
+
+                # shape (N, D)
+                expert_out = expert(x_flat[token_idx])
+
+                # shape (N, 1)
+                weight = topk_weight[mask].view(-1, 1)
+
+                y.index_add_(0, token_idx, expert_out * weight.to(y.dtype))
+
+            elif self.training:
+                y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
+
+        if self.training and self.config.router_aux_loss_coef > 0:
+            # load shape (K, E) where K = num_experts_per_tok, E = num_experts
+            load = F.one_hot(topk_idx, self.config.num_experts).float().mean(0)
+
+            self.aux_loss = (
+                (load * scores.mean(0)).sum()
+                * self.config.num_experts
+                * self.config.router_aux_loss_coef
+            )
+
+        else:
+            self.aux_loss = scores.new_zeros(())
+
+        return y.view(batch_size, seq_len, hidden_dim)
+
+
+    
 class DecoderLayer(nn.Module):
     """
     One decoder layer = attention sublayer + FFN sublayer.
@@ -459,7 +583,10 @@ class DecoderLayer(nn.Module):
             config.rms_norm_eps,
         )
 
-        self.mlp = MLP(config)
+        if config.use_moe:
+            self.mlp = MoEFeedForward(config)
+        else:
+            self.mlp = MLP(config)
 
     def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         '''

@@ -26,6 +26,13 @@ from scratch_pretrain.config import (
 )
 from scratch_pretrain.entry import build_model, load_checkpoint_file
 from scratch_pretrain.dataloader import build_pretrain_dataloader
+from scratch_pretrain.moe import (
+    add_moe_parser_args,
+    build_moe_kwargs_from_args,
+    build_moe_weight_name,
+    collect_router_aux_loss,
+    combine_lm_and_router_loss,
+)
 from scratch_pretrain.optim import build_optimizer
 from scratch_pretrain.tokenizer_utils import load_tokenizer
 
@@ -93,6 +100,12 @@ def build_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_key_value_heads", type=int, default=4)
     parser.add_argument("--intermediate_size", type=int, default=256)
     parser.add_argument("--max_seq_len", type=int, default=128)
+    parser.add_argument("--max_position_embeddings", type=int, default=32768)
+    parser.add_argument("--rope_theta", type=float, default=1e6)
+    parser.add_argument("--rms_norm_eps", type=float, default=1e-6)
+
+    # moe
+    parser = add_moe_parser_args(parser)
 
     return parser
 
@@ -194,6 +207,8 @@ def build_model_config_from_args(args: argparse.Namespace) -> MiniMindConfig:
         MiniMindConfig
     """
 
+    moe_kwargs = build_moe_kwargs_from_args(args)
+
     return MiniMindConfig(
         vocab_size=getattr(args, "vocab_size", 6400),
         hidden_size=args.hidden_size,
@@ -201,7 +216,10 @@ def build_model_config_from_args(args: argparse.Namespace) -> MiniMindConfig:
         num_hidden_layers=args.num_hidden_layers,
         num_attention_heads=args.num_attention_heads,
         num_key_value_heads=args.num_key_value_heads,
-        max_position_embeddings=args.max_seq_len,
+        max_position_embeddings=args.max_position_embeddings,
+        rope_theta=args.rope_theta,
+        rms_norm_eps=args.rms_norm_eps,
+        **moe_kwargs,
     )
 
 
@@ -226,14 +244,22 @@ def build_runtime_from_args(args: argparse.Namespace) -> Dict[str, Any]:
 
     vocab_size = len(tokenizer) if hasattr(tokenizer, "__len__") else getattr(tokenizer, "vocab_size", 6400)
 
+    model_config = build_model_config_from_args(args)
     model_config = MiniMindConfig(
         vocab_size=vocab_size,
-        hidden_size=args.hidden_size,
-        intermediate_size=args.intermediate_size,
-        num_hidden_layers=args.num_hidden_layers,
-        num_attention_heads=args.num_attention_heads,
-        num_key_value_heads=args.num_key_value_heads,
-        max_position_embeddings=args.max_seq_len,
+        hidden_size=model_config.hidden_size,
+        intermediate_size=model_config.intermediate_size,
+        num_hidden_layers=model_config.num_hidden_layers,
+        num_attention_heads=model_config.num_attention_heads,
+        num_key_value_heads=model_config.num_key_value_heads,
+        max_position_embeddings=model_config.max_position_embeddings,
+        rope_theta=model_config.rope_theta,
+        rms_norm_eps=model_config.rms_norm_eps,
+        use_moe=model_config.use_moe,
+        num_experts=model_config.num_experts,
+        num_experts_per_tok=model_config.num_experts_per_tok,
+        moe_intermediate_size=model_config.moe_intermediate_size,
+        router_aux_loss_coef=model_config.router_aux_loss_coef,
     )
 
     dataset = PretrainDataset(
@@ -567,8 +593,16 @@ def run_formal_pretrain(args: argparse.Namespace) -> List[float]:
         accumulation_steps=args.accumulation_steps,
     )
 
-    metrics_path = Path(args.log_dir) / f"{args.save_weight}_metrics.jsonl"
-    text_log_path = Path(args.log_dir) / f"{args.save_weight}.log"
+    if getattr(args, "use_moe", False):
+        weight_name = build_moe_weight_name(
+            save_weight=args.save_weight,
+            hidden_size=args.hidden_size,
+            use_moe=True,
+        )
+    else:
+        weight_name = args.save_weight
+    metrics_path = Path(args.log_dir) / f"{weight_name}_metrics.jsonl"
+    text_log_path = Path(args.log_dir) / f"{weight_name}.log"
 
     update_step = 0
     resume_epoch = 0
@@ -639,7 +673,12 @@ def run_formal_pretrain(args: argparse.Namespace) -> List[float]:
                     input_ids=batch["input_ids"],
                     labels=batch["labels"],
                 )
-                loss = outputs.loss
+                lm_loss = outputs.loss
+                if getattr(args, "use_moe", False):
+                    router_aux_loss = collect_router_aux_loss(model)
+                    loss = combine_lm_and_router_loss(lm_loss, router_aux_loss)
+                else:
+                    loss = lm_loss
 
             loss_value = float(loss.item())
 
@@ -693,7 +732,7 @@ def run_formal_pretrain(args: argparse.Namespace) -> List[float]:
                 )
                 _save_resume_checkpoint(
                     checkpoint_dir=args.checkpoint_dir,
-                    save_weight=args.save_weight,
+                    save_weight=weight_name,
                     checkpoint=_build_formal_checkpoint_state(
                         model=model,
                         optimizer=optimizer,
@@ -741,7 +780,7 @@ def run_formal_pretrain(args: argparse.Namespace) -> List[float]:
             if args.save_interval > 0 and update_step % args.save_interval == 0:
                 _save_resume_checkpoint(
                     checkpoint_dir=args.checkpoint_dir,
-                    save_weight=args.save_weight,
+                    save_weight=weight_name,
                     checkpoint=_build_formal_checkpoint_state(
                         model=model,
                         optimizer=optimizer,
@@ -759,7 +798,7 @@ def run_formal_pretrain(args: argparse.Namespace) -> List[float]:
 
     _save_resume_checkpoint(
         checkpoint_dir=args.checkpoint_dir,
-        save_weight=args.save_weight,
+        save_weight=weight_name,
         checkpoint=_build_formal_checkpoint_state(
             model=model,
             optimizer=optimizer,
@@ -770,7 +809,7 @@ def run_formal_pretrain(args: argparse.Namespace) -> List[float]:
         ),
     )
 
-    final_weight_path = Path(args.out_dir) / f"{args.save_weight}_final.pt"
+    final_weight_path = Path(args.out_dir) / f"{weight_name}_final.pt"
     torch.save(model.state_dict(), final_weight_path)
 
     return loss_history

@@ -4,3 +4,5 @@ __pycache__/
 logs/
 checkpoints/
 out/
+tmp_moe_check/
+colab/
