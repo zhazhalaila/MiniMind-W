@@ -102,8 +102,6 @@ jsonl records
 -> save checkpoint
 ```
 
-## 输入与输出
-
 ### 输入
 
 - `dataset`
@@ -126,7 +124,7 @@ jsonl records
   - `len(loss_history) == max_steps`
 - 一个 checkpoint 文件
 
-## 例子
+### 例子
 
 如果：
 
@@ -159,8 +157,6 @@ project_root
 -> save checkpoint
 -> load checkpoint
 ```
-
-## 输入与输出
 
 ### 输入
 
@@ -305,6 +301,90 @@ python3 scratch_pretrain/train_pretrain.py \
   --rope_theta 1000000 \
   --rms_norm_eps 1e-6 \
   --use_moe 1 \
+  --num_experts 4 \
+  --num_experts_per_tok 1 \
+  --moe_intermediate_size 2432 \
+  --router_aux_loss_coef 5e-4
+```
+
+## KV Cache 对话推理
+
+把对话推理链路搭起来，支持 `KV Cache`。
+
+### 主线
+
+```text
+messages
+-> chat prompt
+-> tokenizer
+-> input_ids
+-> first forward(use_cache=True)
+-> logits[:, -1, :]
+-> sample next token
+-> next forward(last_token + past_key_values)
+-> append token
+-> decode
+```
+
+### 输入
+
+- 对话历史：
+  - `messages: list[dict[str, str]]`
+- 编码后输入：
+  - `input_ids: torch.Tensor`
+    - shape: `(1, L)`
+- 缓存：
+  - `past_key_values`
+    - 每层一个 `tuple[k, v]`
+
+### 输出
+
+- 生成后的 token：
+  - `output_ids: torch.Tensor`
+    - shape: `(1, L_new)`
+- 单轮回复：
+  - `response: str`
+- 新缓存：
+  - `past_key_values`
+
+### Dense 正式推理
+
+```bash
+python3 scratch_pretrain/eval_chat.py \
+  --weight_path out/pretrain_dense/pretrain_dense_final.pt \
+  --tokenizer_dir tokenizer \
+  --device cuda:0 \
+  --max_new_tokens 512 \
+  --temperature 0.85 \
+  --top_p 0.90 \
+  --top_k 50 \
+  --hidden_size 768 \
+  --intermediate_size 2048 \
+  --num_hidden_layers 8 \
+  --num_attention_heads 8 \
+  --num_key_value_heads 2
+```
+
+### MoE 正式推理
+
+```bash
+python3 scratch_pretrain/eval_chat.py \
+  --weight_path out/pretrain_moe/pretrain_768_moe_final.pt \
+  --tokenizer_dir tokenizer \
+  --device cuda:0 \
+  --max_new_tokens 512 \
+  --temperature 0.85 \
+  --top_p 0.90 \
+  --top_k 50 \
+  --hidden_size 768 \
+  --intermediate_size 2432 \
+  --num_hidden_layers 8 \
+  --num_attention_heads 8 \
+  --num_key_value_heads 4 \
+  --max_position_embeddings 32768 \
+  --rope_theta 1000000 \
+  --rms_norm_eps 1e-6 \
+  --use_moe \
   --num_experts 4 \
   --num_experts_per_tok 1 \
   --moe_intermediate_size 2432 \

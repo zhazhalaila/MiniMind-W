@@ -116,9 +116,15 @@ class MiniMindModelOutput:
     Fields:
         last_hidden_state: torch.Tensor
             Shape: (B, L, D)
+        past_key_values (inference, kvcache): tuple[tuple[torch.Tensor, torch.Tensor], ...] | None
+            Length: num_hidden_layers
+            Each layer:
+                k.shape == (B, Hkv, T + L, Hd), where T = current input tokens len, L = history tokens
+                v.shape == (B, Hkv, T + L, Hd)
     """
 
     last_hidden_state: torch.Tensor
+    past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None
 
 
 @dataclass
@@ -132,11 +138,14 @@ class MiniMindCausalLMOutput:
 
         loss: torch.Tensor | None
             Shape: () when labels are provided.
+
+        past_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None
+            Length: num_hidden_layers
     """
 
     logits: torch.Tensor
     loss: Optional[torch.Tensor] = None
-
+    past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None
 
 def build_causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
     """
@@ -344,7 +353,14 @@ class Attention(nn.Module):
         self.register_buffer("sin_cached", sin, persistent=True)
 
 
-    def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+        position_offset: int = 0,
+        ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         batch_size, seq_len, _ = x.shape
 
         # construct Q, K and V
@@ -356,43 +372,88 @@ class Attention(nn.Module):
         # q shape (B, num_heads, L, head_dim) num_heads = self.num_attention_heads
         # k shape (B, num_heads/G, L, head_dim) G = self.num_attention_heads/self.num_key_value_heads
         # v shape (B, num_heads/G, L, head_dim)
+        # notice, in inference, L = T (T=new input tokens), in training, L = seq_len
+        # in inference, q shape (B, num_heads, T, head_dim), k, v shape (B, num_heads/G, T, head_dim)
+        # in inference, k, v shape extend to (B, num_heads/G, T+P (P=past tokens), head_dim) by kv cache
+        # in inference, atten shape (B, num_heads, T, T+P) means current token can see all past tokens include itself
         q = q.view(batch_size, seq_len, self.num_attention_heads, self.head_dim).transpose(1, 2)
         k = k.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        cos = self.cos_cached[:seq_len].to(x.device)
-        sin = self.sin_cached[:seq_len].to(x.device)
+        past_len = 0
+        if past_key_value is not None:
+            past_len = past_key_value[0].size(2)
+            if position_offset == 0:
+                position_offset = past_len
+
+        cos = self.cos_cached[position_offset:position_offset + seq_len].to(x.device)
+        sin = self.sin_cached[position_offset:position_offset + seq_len].to(x.device)
 
         # RoPE
         q, k = apply_rotary_emb(q, k, cos, sin)
 
+        # extend k, v shape from (B, num_heads/G, T, head_dim) to (B, num_heads/G, T+P, head_dim)
+        # we just compute current token's q, k, v, when inference, we should learn from history
+        if past_key_value is not None:
+            past_k, past_v = past_key_value
+            k = torch.cat([past_k, k], dim=2)
+            v = torch.cat([past_v, v], dim=2)
+
+        new_past_key_value = (k, v) if use_cache else None
+
         # extend k,v (B, num_heads/G, L, head_dim) to (B, num_heads, L, head_dim)
         if self.num_key_value_heads != self.num_attention_heads:
-            k = k.repeat_interleave(self.num_key_value_groups, dim=1)
-            v = v.repeat_interleave(self.num_key_value_groups, dim=1)
+            k_for_attn = k.repeat_interleave(self.num_key_value_groups, dim=1)
+            v_for_attn = v.repeat_interleave(self.num_key_value_groups, dim=1)
+        else:
+            k_for_attn = k
+            v_for_attn = v
 
         # attention score shape (B, num_heads, L, L)
         # each element represents attention score
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        # in inference, score shape (B, num_heads, T, T+P)
+        scores = torch.matmul(q, k_for_attn.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
-        causal_mask = build_causal_mask(seq_len, x.device)
-        scores = scores.masked_fill(causal_mask == 0, float("-inf"))
+        # build mask for pretrain and inference (kvcache)
+
+        total_kv_len = k.size(2)
+
+        # shape (1, 1, T, 1), where T = current input tokens
+        query_positions = torch.arange(
+            position_offset,
+            position_offset + seq_len,
+            device=x.device,
+        ).view(1, 1, seq_len, 1)
+
+        key_positions = torch.arange(
+            total_kv_len,
+            device=x.device,
+        ).view(1, 1, 1, total_kv_len)
+
+        # in pretrain, causal_mask shape (B, num_heads, L, L)
+        # in inference, causal_mask shape (B, num_heads, T, T+P)
+        causal_mask = key_positions <= query_positions
+        scores = scores.masked_fill(~causal_mask, float("-inf"))
 
         if attention_mask is not None:
+            if attention_mask.dim() == 2:
+                attention_mask = attention_mask[:, None, None, :]
+            elif attention_mask.dim() == 3:
+                attention_mask = attention_mask[:, None, :, :]
             scores = scores.masked_fill(attention_mask == 0, float("-inf"))
 
         # softmax on masked matrix, shape (B, num_heads, L, L)
         attn_weights = F.softmax(scores.float(), dim=-1).to(q.dtype)
 
         # output shape (B, num_heads, L, head_dim)
-        output = torch.matmul(attn_weights, v)
+        output = torch.matmul(attn_weights, v_for_attn)
         # shape (B, L, num_heads, head_dim)
         output = output.transpose(1, 2).contiguous()
         # shape (B, L, Hidden_Size)
         output = output.view(batch_size, seq_len, self.num_attention_heads * self.head_dim)
 
         output = self.o_proj(output)
-        return output
+        return output, new_past_key_value
 
 class MLP(nn.Module):
     """
@@ -588,7 +649,14 @@ class DecoderLayer(nn.Module):
         else:
             self.mlp = MLP(config)
 
-    def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+            self, 
+            x: torch.Tensor, 
+            attention_mask: Optional[torch.Tensor] = None,
+            past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+            use_cache: bool = False,
+            position_offset: int = 0,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         '''
         Attention Input Shape (B, L, D)
                   Output Shape (B, L, D)
@@ -597,14 +665,21 @@ class DecoderLayer(nn.Module):
         '''
         
         attn_input = self.input_layernorm(x)
-        attn_output = self.self_attn(attn_input, attention_mask=attention_mask)
+        attn_output, new_past_key_value = self.self_attn(
+            attn_input, 
+            attention_mask=attention_mask,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+            position_offset=position_offset
+            )
+        
         x = x + attn_output
 
         mlp_input = self.post_attention_layernorm(x)
         mlp_output = self.mlp(mlp_input)
         x = x + mlp_output
 
-        return x
+        return x, new_past_key_value
 
 
 class MiniMindModel(nn.Module):
@@ -616,10 +691,21 @@ class MiniMindModel(nn.Module):
             Shape: (B, L)
         attention_mask: torch.Tensor | None
             Optional external mask
+        past_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None
+            Length: num_hidden_layers
+            Each layer:
+                past_k.shape == (B, Hkv, T, Hd)
+                past_v.shape == (B, Hkv, T, Hd)
+        use_cache: bool
 
     Output from forward:
         MiniMindModelOutput
             last_hidden_state shape: (B, L, D)
+            past_key_values:
+                None, or length == num_hidden_layers
+                Each layer:
+                    new_k.shape == (B, Hkv, T + L, Hd)
+                    new_v.shape == (B, Hkv, T + L, Hd)
     """
 
     def __init__(self, config: MiniMindConfig):
@@ -644,15 +730,43 @@ class MiniMindModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
+        use_cache: bool = False,
     ) -> MiniMindModelOutput:
         hidden_states = self.embed_tokens(input_ids)
 
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask=attention_mask)
+        if past_key_values is None:
+            past_key_values = tuple([None] * len(self.layers))
+            position_offset = 0
+        else:
+            if len(past_key_values) != len(self.layers):
+                raise ValueError(
+                    "past_key_value length must match num_hidden_layers."
+                )
+            
+            first_layer_past = past_key_values[0]
+            position_offset = 0 if first_layer_past is None else first_layer_past[0].size(2)
+
+        next_past_key_values = [] if use_cache else None
+
+        for layer, layer_past_key_value in zip(self.layers, past_key_values):
+            hidden_states, new_layer_past_key_value = layer(
+                hidden_states, 
+                attention_mask=attention_mask,
+                past_key_value=layer_past_key_value,
+                use_cache=use_cache,
+                position_offset=position_offset,
+            )
+
+            if use_cache:
+                next_past_key_values.append(new_layer_past_key_value)
 
         hidden_states = self.norm(hidden_states)
 
-        return MiniMindModelOutput(last_hidden_state=hidden_states)
+        return MiniMindModelOutput(
+            last_hidden_state=hidden_states,
+            past_key_values=tuple(next_past_key_values) if use_cache else None,
+        )
 
 class MiniMindForCausalLM(nn.Module):
     """
@@ -664,11 +778,15 @@ class MiniMindForCausalLM(nn.Module):
         labels: torch.Tensor | None
             Shape: (B, L)
         attention_mask: torch.Tensor | None
+        past_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None
+        use_cache: bool
 
     Output from forward:
         MiniMindCausalLMOutput
             logits shape: (B, L, V)
             loss shape: () when labels are provided
+            past_key_values:
+                None, or length == num_hidden_layers
     """
 
     def __init__(self, config: MiniMindConfig):
@@ -689,12 +807,16 @@ class MiniMindForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
+        use_cache: bool = False,
     ) -> MiniMindCausalLMOutput:
         
         # shape (B, L, Hidden_Size)
         model_output = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
         )
 
         hidden_states = model_output.last_hidden_state
@@ -718,4 +840,5 @@ class MiniMindForCausalLM(nn.Module):
         return MiniMindCausalLMOutput(
             logits=logits,
             loss=loss,
+            past_key_values=model_output.past_key_values,
         )

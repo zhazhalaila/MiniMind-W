@@ -6,3 +6,4 @@ checkpoints/
 out/
 tmp_moe_check/
 colab/
+tmp_inference_kvcache_checks/
