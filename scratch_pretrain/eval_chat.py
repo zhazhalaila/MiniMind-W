@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import os
+import sys
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import argparse
 from torch import nn
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from model.model_minimind import MiniMindConfig
 from scratch_pretrain.entry import build_model, load_checkpoint_file
@@ -47,7 +51,7 @@ def load_inference_artifacts(
     else:
         state_dict = payload
 
-    model.load_state_dict(state_dict, strict=False)
+    model.load_state_dict(state_dict, strict=True)
     model.eval()
 
     return tokenizer, model
@@ -358,15 +362,15 @@ def run_chat_cli() -> None:
     parser.add_argument("--num_hidden_layers", type=int, required=True)
     parser.add_argument("--num_attention_heads", type=int, required=True)
     parser.add_argument("--num_key_value_heads", type=int, required=True)
-    parser.add_argument("--max_position_embeddings", type=int, default=512)
-    parser.add_argument("--rope_theta", type=float, default=10000.0)
+    parser.add_argument("--max_position_embeddings", type=int, default=32768)
+    parser.add_argument("--rope_theta", type=float, default=1000000.0)
     parser.add_argument("--rms_norm_eps", type=float, default=1e-6)
 
     parser.add_argument("--use_moe", action="store_true")
     parser.add_argument("--num_experts", type=int, default=4)
     parser.add_argument("--num_experts_per_tok", type=int, default=1)
     parser.add_argument("--moe_intermediate_size", type=int, default=None)
-    parser.add_argument("--router_aux_loss_coef", type=float, default=0.0)
+    parser.add_argument("--router_aux_loss_coef", type=float, default=5e-4)
 
     args = parser.parse_args()
 

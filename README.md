@@ -390,3 +390,53 @@ python3 scratch_pretrain/eval_chat.py \
   --moe_intermediate_size 2432 \
   --router_aux_loss_coef 5e-4
 ```
+
+## SFT
+
+
+SFT 的核心不是改模型结构，而是改数据整理方式和 `labels` 的监督区域。
+
+相较于Pretrain，主要区别如下：
+1. 更换了数据集，SFT用的数据集是对话数据集
+2. Loss的计算方式不同，在SFT数据集中用户的prompt不计入损失，只算response的Loss
+
+### 主线
+
+```text
+record["conversations"]
+-> format_sft_messages(...)
+-> build_sft_chat_prompt(...)
+-> postprocess_sft_prompt(...)
+-> tokenize
+-> input_ids
+-> build_sft_special_token_ids(...)
+-> generate_sft_labels(...)
+-> pad
+-> batch
+-> model(input_ids, labels)
+-> sft loss
+```
+
+### 例子
+
+假设 chat template 后的文本逻辑是：
+
+```text
+<bos>user
+杭州在哪里？
+<eos>
+<bos>assistant
+杭州在浙江省。
+<eos>
+```
+
+那么：
+
+- 整段都会进 `input_ids`
+- 但只有 `assistant` 这段会进监督，也就是说在计算Loss时，不会计算用户的prompt"杭州在哪里？"
+
+对应的 `labels` 逻辑是：
+
+```text
+[-100, -100, ..., -100,  真正的assistant token ids..., eos_token_id, ...]
+```
