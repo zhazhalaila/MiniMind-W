@@ -440,3 +440,73 @@ record["conversations"]
 ```text
 [-100, -100, ..., -100,  真正的assistant token ids..., eos_token_id, ...]
 ```
+
+## DPO 
+
+用偏好数据继续训练 SFT 模型，让模型更偏向 `chosen`，更远离 `rejected`。
+
+与Pretrain的区别：
+
+1. 输入的数据格式不同
+2. Loss的计算不同
+3. 还需要一个ref model，这样可以使得新训练的模型不偏离ref model太远
+
+### Loss 主线
+
+对一个 batch：
+
+```text
+x_chosen.shape   = (B, L)
+x_rejected.shape = (B, L)
+```
+
+拼接后：
+
+```text
+x.shape    = (2B, L)
+y.shape    = (2B, L)
+mask.shape = (2B, L)
+```
+
+然后：
+
+```text
+ref_logits    = ref_model(x).logits
+policy_logits = policy_model(x).logits
+```
+
+logits shape：
+
+```text
+ref_logits.shape    = (2B, L, V)
+policy_logits.shape = (2B, L, V)
+```
+
+取目标 token 的 log prob（按labels取出正确token的log概率）：
+
+```text
+ref_log_probs.shape    = (2B, L)
+policy_log_probs.shape = (2B, L)
+```
+
+按 mask 求每条序列的总 log prob：
+
+```text
+sequence_log_probs.shape = (2B,)
+```
+
+前一半是 chosen，后一半是 rejected：
+
+```text
+chosen_log_probs.shape   = (B,)
+rejected_log_probs.shape = (B,)
+```
+
+DPO 核心：
+
+```text
+pi_logratios  = chosen_policy_log_probs - rejected_policy_log_probs
+ref_logratios = chosen_ref_log_probs    - rejected_ref_log_probs
+logits        = pi_logratios - ref_logratios
+loss          = -logsigmoid(beta * logits).mean()
+```

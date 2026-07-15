@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -51,7 +52,8 @@ def load_inference_artifacts(
     else:
         state_dict = payload
 
-    model.load_state_dict(state_dict, strict=True)
+    if state_dict:
+        model.load_state_dict(state_dict, strict=True)
     model.eval()
 
     return tokenizer, model
@@ -106,6 +108,7 @@ def build_chat_messages(
 def build_chat_prompt(
     messages: List[Dict[str, str]],
     tokenizer: Any,
+    open_thinking: bool = False,
 ) -> str:
     """
     Convert chat messages into one prompt string.
@@ -119,11 +122,19 @@ def build_chat_prompt(
     """
 
     if hasattr(tokenizer, "apply_chat_template"):
-        prompt = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        try:
+            prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                open_thinking=open_thinking,
+            )
+        except TypeError:
+            prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
         return prompt
     
     parts = []
@@ -292,11 +303,12 @@ def chat_once(
     tokenizer: Any,
     messages: List[Dict[str, str]],
     device: Union[str, torch.device],
-    max_new_tokens: int = 128,
+    max_new_tokens: int = 8192,
     eos_token_id: Optional[int] = None,
-    temperature: float = 1.0,
-    top_p: float = 1.0,
+    temperature: float = 0.85,
+    top_p: float = 0.95,
     top_k: int = 0,
+    open_thinking: bool = False,
 ) -> str:
     """
     Generate one assistant response from chat messages.
@@ -316,7 +328,7 @@ def chat_once(
         response: str
     """
 
-    prompt = build_chat_prompt(messages, tokenizer)
+    prompt = build_chat_prompt(messages, tokenizer, open_thinking=open_thinking)
     input_ids = encode_chat_prompt(prompt, tokenizer, device)
 
     output_ids = generate_with_kv_cache(
@@ -350,11 +362,14 @@ def run_chat_cli() -> None:
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
     parser.add_argument("--system_prompt", type=str, default=None)
-    parser.add_argument("--max_new_tokens", type=int, default=128)
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--max_new_tokens", type=int, default=8192)
+    parser.add_argument("--temperature", type=float, default=0.85)
+    parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--top_k", type=int, default=0)
     parser.add_argument("--eos_token_id", type=int, default=None)
+    parser.add_argument("--open_thinking", type=int, default=0, choices=[0, 1])
+    parser.add_argument("--historys", type=int, default=0)
+    parser.add_argument("--show_speed", type=int, default=1, choices=[0, 1])
 
     parser.add_argument("--vocab_size", type=int, default=None)
     parser.add_argument("--hidden_size", type=int, required=True)
@@ -436,12 +451,14 @@ def run_chat_cli() -> None:
             print("history cleared")
             continue
 
+        current_history = history[-args.historys:] if args.historys else []
         messages = build_chat_messages(
             user_text=user_text,
             system_prompt=args.system_prompt,
-            history=history,
+            history=current_history,
         )
 
+        start_time = time.time()
         response = chat_once(
             model=model,
             tokenizer=tokenizer,
@@ -452,9 +469,19 @@ def run_chat_cli() -> None:
             temperature=args.temperature,
             top_p=args.top_p,
             top_k=args.top_k,
+            open_thinking=bool(args.open_thinking),
         )
 
         print(f"assistant> {response}")
+        if args.show_speed:
+            elapsed = max(time.time() - start_time, 1e-6)
+            encoded_response = tokenizer(response, add_special_tokens=False)
+            if isinstance(encoded_response, dict):
+                response_token_ids = encoded_response["input_ids"]
+            else:
+                response_token_ids = encoded_response.input_ids
+            generated_tokens = len(response_token_ids)
+            print(f"[Speed]: {generated_tokens / elapsed:.2f} tokens/s")
 
         history.append({"role": "user", "content": user_text})
         history.append({"role": "assistant", "content": response})
