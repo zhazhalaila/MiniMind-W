@@ -510,3 +510,43 @@ ref_logratios = chosen_ref_log_probs    - rejected_ref_log_probs
 logits        = pi_logratios - ref_logratios
 loss          = -logsigmoid(beta * logits).mean()
 ```
+
+## LoRA
+
+在已有 `full_sft` 上，只训练少量低秩 adapter 参数，完成低成本微调。
+
+```text
+原 Linear 输出:   y = x @ W.T
+加 LoRA 后输出:  y = x @ W.T + LoRA(x)
+```
+
+其中：
+
+- 原模型权重冻结
+- 只训练 LoRA 的 `A/B` 两个低秩矩阵
+- 训练数据仍然是 SFT 格式
+- loss 仍然是 SFT loss
+- 保存时只保存 LoRA 权重，不保存完整模型
+
+lora只工作于方阵上，也就是一个权重矩阵(in_features, out_features)，其中in_features=out_features
+
+lora其实就是在原始model的forward后加了一层：
+
+new_forward = model.forward(x) + LoRA(x)
+
+其中LoRa(x) = A(x) @ B(x)，A的shape是(hidden_size, rank)，B的shape是(rank, hidden_size)
+
+在训练时LoRA的权重矩阵的参数设定为require_grad = True, 原始model的权重矩阵的参数设定为require_grad = False
+
+### 主线
+
+```text
+load base model
+-> apply_lora
+-> freeze non-lora params
+-> load SFT-style data
+-> forward
+-> SFT loss
+-> backward only LoRA params
+-> save LoRA weights
+```
